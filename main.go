@@ -1,23 +1,23 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/jimmykodes/gommand"
-	"github.com/jimmykodes/gommand/flags"
 )
 
 var (
 	ErrEmptyInput = errors.New("response cannot be empty")
 )
 
-func init() {
-	rootCmd.Flags().AddFlagSet(Flags())
-}
+var (
+	lastResponseFile string
+)
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
@@ -25,82 +25,70 @@ func main() {
 	}
 }
 
+type Response struct {
+	Yesterday string `json:"yesterday"`
+	Today     string `json:"today"`
+	Blocked   bool   `json:"blocked"`
+	OnTime    bool   `json:"on_time"`
+}
+
 var rootCmd = &gommand.Command{
 	Name:        "standup",
 	Usage:       "standup",
 	Description: "create standup message",
+	PreRun: func(_ *gommand.Context) error {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("home dir: %w", err)
+		}
+		lastResponseFile = filepath.Join(homeDir, ".standup")
+		return nil
+	},
 	Run: func(ctx *gommand.Context) error {
-		var (
-			data = struct {
-				Yesterday string
-				Today     string
-				Blocked   bool
-				OnTime    bool
-			}{
-				Yesterday: ctx.Flags().String("yesterday"),
-				Today:     ctx.Flags().String("today"),
-				Blocked:   ctx.Flags().Bool("blocked"),
-				OnTime:    ctx.Flags().Bool("on-time"),
-			}
-			qMap = map[string]*survey.Question{
-				"yesterday": {
-					Name:   "yesterday",
-					Prompt: &survey.Input{Message: "What did you do yesterday?"},
-					Validate: func(ans interface{}) error {
-						if ans.(string) == "" {
-							return ErrEmptyInput
-						}
-						return nil
-					},
-				},
-				"today": {
-					Name:   "today",
-					Prompt: &survey.Input{Message: "What are you working on today?"},
-					Validate: func(ans interface{}) error {
-						if ans.(string) == "" {
-							return ErrEmptyInput
-						}
-						return nil
-					},
-				},
-				"blocked": {
-					Name:   "blocked",
-					Prompt: &survey.Confirm{Message: "Are you blocked?"},
-				},
-				"on-time": {
-					Name:   "onTime",
-					Prompt: &survey.Confirm{Message: "Are you on time?"},
-				},
-			}
-		)
-
-		var questions []*survey.Question
-		if data.Yesterday == "" {
-			questions = append(questions, qMap["yesterday"])
+		lastResponse, err := previousResponse()
+		if err != nil {
+			fmt.Println("error loading last response:", err)
+			return err
 		}
-		if data.Today == "" {
-			questions = append(questions, qMap["today"])
-		}
-		if len(questions) > 0 {
-			questions = append(questions, qMap["blocked"], qMap["on-time"])
-			if err := survey.Ask(questions, &data); err != nil {
-				fmt.Println("error:", err)
-				return err
-			}
+		questions := []*survey.Question{
+			{
+				Name:   "yesterday",
+				Prompt: &survey.Input{Message: "What did you do yesterday?", Default: lastResponse.Today},
+				Validate: func(ans interface{}) error {
+					if ans.(string) == "" {
+						return ErrEmptyInput
+					}
+					return nil
+				},
+			},
+			{
+				Name:   "today",
+				Prompt: &survey.Input{Message: "What are you working on today?"},
+				Validate: func(ans interface{}) error {
+					if ans.(string) == "" {
+						return ErrEmptyInput
+					}
+					return nil
+				},
+			},
+			{
+				Name:   "blocked",
+				Prompt: &survey.Confirm{Message: "Are you blocked?", Default: lastResponse.Blocked},
+			},
+			{
+				Name:   "onTime",
+				Prompt: &survey.Confirm{Message: "Are you on time?", Default: lastResponse.OnTime},
+			},
 		}
 
-		var out io.WriteCloser
-		if output := ctx.Flags().String("output"); output == "" {
-			out = os.Stdout
-		} else {
-			f, err := os.Create(output)
-			if err != nil {
-				fmt.Println("error creating file:", err)
-				return err
-			}
-			out = f
+		var data Response
+		if err := survey.Ask(questions, &data); err != nil {
+			fmt.Println("error:", err)
+			return err
 		}
-		defer out.Close()
+		if err := saveResponse(data); err != nil {
+			fmt.Println("Warning: could not save response results", err)
+		}
 
 		for _, item := range [][2]string{
 			{":yesterday:", data.Yesterday},
@@ -108,23 +96,11 @@ var rootCmd = &gommand.Command{
 			{":road-block:", stringify(data.Blocked)},
 			{":on-time:", stringify(data.OnTime)},
 		} {
-			fmt.Fprintln(out, item[0], item[1])
+			fmt.Println(item[0], item[1])
 		}
 
 		return nil
 	},
-}
-
-func Flags() *flags.FlagSet {
-	fs := flags.NewFlagSet(flags.WithNoEnv())
-
-	fs.StringS("yesterday", 'y', "", "what you did yesterday")
-	fs.StringS("today", 't', "", "what you are doing today")
-	fs.BoolS("blocked", 'b', false, "whether you are blocked")
-	fs.BoolS("on-time", 'o', false, "whether you are on time")
-	fs.StringS("output", 'O', "", "file to write output to (stdout if empty)")
-
-	return fs
 }
 
 func stringify(b bool) string {
@@ -132,4 +108,32 @@ func stringify(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func previousResponse() (Response, error) {
+	var resp Response
+	if _, err := os.Stat(lastResponseFile); err != nil {
+		return resp, nil
+	}
+	f, err := os.Open(lastResponseFile)
+	if err != nil {
+		return resp, fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+	if err := json.NewDecoder(f).Decode(&resp); err != nil {
+		return resp, fmt.Errorf("json decode: %w", err)
+	}
+	return resp, nil
+}
+
+func saveResponse(resp Response) error {
+	f, err := os.Create(lastResponseFile)
+	if err != nil {
+		return fmt.Errorf("file create: %w", err)
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(resp); err != nil {
+		return fmt.Errorf("json encode: %w", err)
+	}
+	return nil
 }
